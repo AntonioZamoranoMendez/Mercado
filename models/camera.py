@@ -12,4 +12,8 @@ class Camera:
         Construye la URL RTSP para la cámara.
         Nota: La ruta final puede variar según el fabricante (ej. /stream1, /cam/realmonitor, etc.).
         """
-        return f"rtsp://{self.username}:{self.password}@{self.ip}:{self.port}/stream1"
+        # Si el nombre o IP es "demo", usar la webcam local
+        if self.ip.lower() == "demo" or self.name.lower() == "cam demo":
+            return 0
+        return f"rtsp://{self.username}:{self.password}@{self.ip}:{self.port}/"
+        

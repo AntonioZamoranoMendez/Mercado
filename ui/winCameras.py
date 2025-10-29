@@ -10,6 +10,10 @@ import os
 
 from models.camera import Camera
 from database.database import Database
+from models.event import Event
+import datetime
+import uuid
+
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -63,7 +67,7 @@ class WinCameras(tk.Toplevel):
         right_pane.grid(row=0, column=1, sticky="nsew")
         
         self.video_label = ttk.Label(right_pane, text="Seleccione una cámara para iniciar la visualización", 
-                                     font=("Helvetica", 14), anchor="center", background="black", foreground="white")
+                                    font=("Helvetica", 14), anchor="center", background="black", foreground="white")
         self.video_label.pack(fill=tk.BOTH, expand=True)
 
         # --- Panel Inferior (Botones) ---
@@ -143,53 +147,73 @@ class WinCameras(tk.Toplevel):
         try:
             rtsp_url = camera.get_rtsp_url()
             self.video_label.after(0, lambda: self.video_label.config(text=f"Conectando a {camera.name}..."))
-            
+    
             cap = cv2.VideoCapture(rtsp_url)
             if not cap.isOpened():
                 self.video_label.after(0, lambda: self.video_label.config(text=f"Error al conectar con la cámara {camera.name}"))
                 return
-
+    
+            fps = 20  # FPS para grabar el evento
+            event_duration_sec = 4
+            event_frame_count = fps * event_duration_sec
+            recording = False
+            frames_buffer = []
+    
             while not self.stop_thread.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     break
-
+                
                 # Realizar detección
                 results = self.yolo_model(frame, verbose=False)
                 annotated_frame = results[0].plot()
-
+                detections = results[0].boxes
+    
+                if len(detections) > 0 and not recording:
+                    # Iniciar grabación de evento
+                    recording = True
+                    frames_buffer = [frame.copy()]
+                    frames_collected = 1
+                elif recording:
+                    frames_buffer.append(frame.copy())
+                    frames_collected += 1
+                    if frames_collected >= event_frame_count:
+                        # Guardar video y resetear buffer
+                        self._save_event_video(camera, frames_buffer)
+                        recording = False
+                        frames_buffer = []
+    
                 # Convertir para Tkinter
                 h, w, _ = annotated_frame.shape
                 aspect_ratio = w / h
-                
+    
                 label_w = self.video_label.winfo_width()
                 label_h = self.video_label.winfo_height()
-
+    
                 new_w = label_w
                 new_h = int(new_w / aspect_ratio)
-
+    
                 if new_h > label_h:
                     new_h = label_h
                     new_w = int(new_h * aspect_ratio)
-
-                # Prevenir error si la ventana no está visible aún
+    
                 if new_w > 0 and new_h > 0:
                     resized_frame = cv2.resize(annotated_frame, (new_w, new_h))
                     rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-                    
+    
                     pil_image = Image.fromarray(rgb_frame)
                     tk_image = ImageTk.PhotoImage(image=pil_image)
-                    
-                    # Actualizar UI desde el hilo principal
+    
                     self.video_label.after(0, self._update_video_label, tk_image)
-
+    
         except Exception as e:
-            print(f"Error en el hilo de video: {e}") # Log para depuración
+            print(f"Error en el hilo de video: {e}")  # Log para depuración
         finally:
             if cap:
                 cap.release()
             if not self.stop_thread.is_set():
-                 self.video_label.after(0, lambda: self.video_label.config(text=f"Se perdió la conexión con {camera.name}"))
+                self.video_label.after(0, lambda: self.video_label.config(text=f"Se perdió la conexión con {camera.name}"))
+    
 
     def _update_video_label(self, tk_image):
         """Función auxiliar para actualizar el label de video en el hilo principal."""
@@ -278,3 +302,74 @@ class WinCameras(tk.Toplevel):
 
         save_button = ttk.Button(form_frame, text="Guardar", command=on_save)
         save_button.grid(row=len(fields), columnspan=2, pady=10)
+
+        
+        
+    def _save_event(self, camera: Camera, detections, frame):
+        """Guarda un evento detectado con imagen en disco y registro en la BD."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Crear carpeta para guardar imágenes
+        images_dir = os.path.join("events_images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        # Generar nombre único de imagen
+        image_name = f"{camera.name}_{uuid.uuid4().hex[:8]}.jpg"
+        image_path = os.path.join(images_dir, image_name)
+
+        # Guardar frame con detecciones
+        cv2.imwrite(image_path, frame)
+
+        # Crear descripción simple
+        labels = [self.yolo_model.names[int(box.cls[0])] for box in detections]
+        description = f"Detección en {camera.name}: {', '.join(set(labels))}"
+
+        # Crear y guardar el evento
+        event = Event(
+            id=None,
+            camera_id=camera.id,
+            timestamp=timestamp,
+            description=description,
+            image_path=image_path
+        )
+        self.db.add_event(event)
+
+        print(f"[EVENTO GUARDADO] {description} ({timestamp})")
+        
+    def _save_event_video(self, camera: Camera, frames):
+        """
+        Guarda un pequeño video de los frames capturados en un evento.
+        """
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        videos_dir = "events_videos"
+        os.makedirs(videos_dir, exist_ok=True)
+
+        video_name = f"{camera.name}-{timestamp}.avi"
+        video_path = os.path.join(videos_dir, video_name)
+
+        if not frames:
+            return
+
+        height, width, _ = frames[0].shape
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Cambiar a 'mp4v' si quieres .mp4
+        out = cv2.VideoWriter(video_path, fourcc, 20.0, (width, height))
+
+        for f in frames:
+            out.write(f)
+        out.release()
+
+        # Guardar evento en la BD
+        objetos_detectados = [
+            self.yolo_model.names[int(box.cls[0])] for box in frames[-1].boxes
+        ]
+        description = f"Detección en {camera.name}: {', '.join(set(objetos_detectados))}"
+
+        event = Event(
+            id=None,
+            camera_id=camera.id,
+            timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            description=description,
+            image_path=video_path  # Aquí guardamos el video en lugar de una imagen
+        )
+        self.db.add_event(event)
+        print(f"[EVENTO VIDEO GUARDADO] {description} -> {video_path}")
