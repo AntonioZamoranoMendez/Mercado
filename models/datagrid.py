@@ -9,7 +9,7 @@ class DataGrid:
 
         rows = int((height-20)/row_height)
 
-        self.tvw = ttk.Treeview(self.frame, selectmode="browse", height=rows)
+        self.tvw = ttk.Treeview(self.frame, selectmode="browse", height=rows, show="headings")
         self.vsb = ttk.Scrollbar(self.frame, orient="vertical", command=self.tvw.yview)
         self.hsb = ttk.Scrollbar(self.frame, orient="horizontal", command=self.tvw.xview)
 

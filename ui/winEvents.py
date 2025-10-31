@@ -13,43 +13,89 @@ class WinEvents(TopWindow):
         main_frame = ttk.Frame(self)
         main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # DataGrid
+                # --- Barra de búsqueda ---
+        search_frame = ttk.Frame(main_frame)
+        search_frame.pack(fill="x", pady=(0, 10))
+
+        self.search_var = StringVar(self)
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.pack(side="left", expand=True, fill="x", padx=5)
+
+        # Placeholder
+        placeholder = "Buscar por cámara o descripción..."
+        search_entry.insert(0, placeholder)
+        search_entry.config(foreground="gray")
+
+        def on_focus_in(event):
+            if search_entry.get() == placeholder:
+                search_entry.delete(0, "end")
+                search_entry.config(foreground="black")
+
+        def on_focus_out(event):
+            if search_entry.get() == "":
+                search_entry.insert(0, placeholder)
+                search_entry.config(foreground="gray")
+
+        search_entry.bind("<FocusIn>", on_focus_in)
+        search_entry.bind("<FocusOut>", on_focus_out)
+
+        # Botón de búsqueda
+        btn_search = ttk.Button(search_frame, text="Buscar", command=self.search_events)
+        btn_search.pack(side="left", padx=5)
+
+
+        # --- DataGrid ---
         dg_frame = ttk.Frame(main_frame)
         dg_frame.pack(fill="both", expand=True)
 
         self.datagrid = DataGrid(dg_frame, width=780, height=500)
         self.datagrid.add_columns(
             columns=["ID", "Cámara", "Fecha y Hora", "Descripción"],
-            widths=[10, 100, 150, 480]
+            widths=[15, 100, 150, 480]
         )
         self.load_events()
 
-        # CRUD y Salir
+        # --- Botón de salir ---
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill="x", pady=(0, 10))
-
-        btn_add = ttk.Button(btn_frame, text="Agregar")
-        btn_edit = ttk.Button(btn_frame, text="Editar")
-        btn_delete = ttk.Button(btn_frame, text="Eliminar")
-        btn_exit = ttk.Button(btn_frame, text="Salir", command=self.destroy)
-
-        btn_add.pack(side="left", expand=True, padx=5)
-        btn_edit.pack(side="left", expand=True, padx=5)
-        btn_delete.pack(side="left", expand=True, padx=5)
-        btn_exit.pack(side="right", expand=True, padx=5)
-
-
+        btn_frame.pack(fill="x", pady=(10, 0))
 
     def load_events(self):
         self.datagrid.clear()
+        try:
+            events = self.db.get_events()
+            print(f"Eventos obtenidos: {len(events)}")
+            for event in events:
+                print(f"Inserting: {event.id}, {event.camera_id}, {event.timestamp}, {event.description}")
+                self.datagrid.insert_row(
+                    values=[event.id, event.camera_id, event.timestamp, event.description]
+                )
+        except Exception as e:
+            print(f"Error al cargar eventos: {e}")
+
+
+    def search_events(self):
+        keyword = self.search_var.get().strip().lower()
+        placeholder = "buscar por cámara o descripción..."
+
+        self.datagrid.clear()
         events = self.db.get_events()
-        for event in events:
+
+        # Si está vacío o tiene el placeholder, mostrar todos los eventos
+        if not keyword or keyword == placeholder:
+            filtered = events
+        else:
+            filtered = [
+                e for e in events
+                if keyword in str(e.camera_id).lower() or keyword in str(e.description).lower()
+            ]
+
+        for event in filtered:
             self.datagrid.insert_row(
                 values=[event.id, event.camera_id, event.timestamp, event.description]
             )
 
+
 if __name__ == "__main__":
-    from tkinter import Tk
     root = Tk()
     app = WinEvents(root)
     root.mainloop()

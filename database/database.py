@@ -105,12 +105,26 @@ class Database:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id, camera_id, timestamp, description, image_path FROM events ORDER BY timestamp DESC")
+            cursor.execute("""
+                SELECT id, camera_id, timestamp, description
+                FROM events
+                ORDER BY timestamp DESC
+            """)
             rows = cursor.fetchall()
-            return [Event(id=row[0], camera_id=row[1], timestamp=row[2], description=row[3], image_path=row[4]) for row in rows]
+            return [
+                Event(
+                    id=row[0],
+                    camera_id=row[1],
+                    timestamp=row[2],
+                    description=row[3]
+                )
+                for row in rows
+            ]
         finally:
             if conn:
                 conn.close()
+
+
 
     def add_event(self, event: Event) -> int:
         """Agrega un nuevo evento a la base de datos."""

@@ -17,4 +17,3 @@ class Event:
     
     def return_image(self) -> str:
         return self.image_path
-    
