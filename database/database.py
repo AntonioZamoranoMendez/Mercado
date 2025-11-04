@@ -15,6 +15,23 @@ class Database:
     def _get_connection(self):
         """Crea y devuelve una conexión a la base de datos."""
         return sqlite3.connect(self.db_path)
+    
+    
+    def add_event(self, event: Event) -> int:
+        """Agrega un nuevo evento a la base de datos."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO events (camera_id, timestamp, description, image_path) VALUES (?, ?, ?, ?)",
+                (event.camera_id, event.timestamp, event.description, event.image_path)
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            if conn:
+                conn.close()
+    
 
     def _create_table(self):
         """Crea la tabla 'cameras' si no existe."""
@@ -164,6 +181,42 @@ class Database:
             cursor.execute("DELETE FROM events WHERE id=?", (event_id,))
             conn.commit()
             return cursor.rowcount > 0
+        finally:
+            if conn:
+                conn.close()
+
+    def get_events_by_camera(self, camera_id: int) -> list[Event]:
+        """Retorna todos los eventos asociados a una cámara"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+            SELECT id, camera_id, timestamp, description, image_path
+            FROM events e1
+            WHERE camera_id = ?
+            AND timestamp = (
+                SELECT MIN(timestamp) 
+                FROM events e2 
+                WHERE e2.timestamp = e1.timestamp AND e2.camera_id = e1.camera_id
+            )
+            ORDER BY timestamp DESC
+            """,
+                (camera_id,)   
+            )
+            
+            rows = cursor.fetchall()
+            events = [
+                Event(
+                    id=row[0],
+                    camera_id=row[1],
+                    timestamp=row[2],
+                    description=row[3],
+                    image_path=row[4] if len(row) > 4 else None
+                )
+                for row in rows
+            ]
+            return events
         finally:
             if conn:
                 conn.close()
