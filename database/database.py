@@ -71,6 +71,7 @@ class Database:
             cursor.execute("SELECT id, name, ip, username, password, port FROM cameras ORDER BY name")
             rows = cursor.fetchall()
             return [Camera(id=row[0], name=row[1], ip=row[2], username=row[3], password=row[4], port=row[5]) for row in rows]
+            print(rows)
         finally:
             if conn:
                 conn.close()
@@ -217,6 +218,29 @@ class Database:
                 for row in rows
             ]
             return events
+        finally:
+            if conn:
+                conn.close()
+
+    def get_event_by_id(self, event_id: int) -> Event | None:
+        """Obtiene un evento por su ID"""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, camera_id, timestamp, description, image_path FROM events WHERE id=?",
+                (event_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return Event(
+                    id=row[0],
+                    camera_id=row[1],
+                    timestamp=row[2],
+                    description=row[3],
+                    image_path=row[4]
+                )
+            return None
         finally:
             if conn:
                 conn.close()

@@ -5,7 +5,7 @@ import threading
 import cv2
 from PIL import Image, ImageTk
 from ultralytics import YOLO
-import sys, os, datetime, uuid
+import sys, os, uuid
 import glob
 import os
 from tkinter import filedialog
@@ -13,6 +13,9 @@ from models.camera import Camera
 from database.database import Database
 from models.event import Event
 import math
+import time
+from datetime import datetime
+import threading
 
 def resource_path(relative_path):
     try:
@@ -20,7 +23,6 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
-
 
 class WinCameras(ttk.Frame):
     def __init__(self, master):
@@ -36,8 +38,9 @@ class WinCameras(ttk.Frame):
 
         try:
             self.yolo_model = YOLO(resource_path('models/best.pt'))
+            self.yolo_person = YOLO("yolov8n.pt")  # Detecta personas
         except Exception as e:
-            messagebox.showerror("Error de Modelo", f"No se pudo cargar el modelo YOLO 'models/best.pt'.\n{e}")
+            messagebox.showerror("Error de Modelo", f"No se pudo cargar el modelo YOLO 'models/best.pt' o bien, 'yolov8n.pt'.\n{e}")
             return
 
         # === Layout principal ===
@@ -97,77 +100,50 @@ class WinCameras(ttk.Frame):
 
         # Llenar lista inicial
         self._populate_camera_list()
+        self._start_background_detection()
+
+        self._event_lock = threading.Lock()
+        self.last_event_times = {}  # inicializamos aquí para que no haga falta hasattr
 
         # --- Nuevo botón para subir video desde PC ---
-        self.test_video_button = ttk.Button(button_frame, text="Probar video local", command=self._load_local_video)
-        self.test_video_button.pack(side=tk.RIGHT, padx=5)
+        #self.test_video_button = ttk.Button(button_frame, text="Probar video local", command=self._load_local_video)
+        #self.test_video_button.pack(side=tk.RIGHT, padx=5)
 
-    def _load_local_video(self):
-        """Permite seleccionar un archivo de video y mostrar detecciones con YOLO."""
-        file_path = filedialog.askopenfilename(
-            title="Seleccionar video",
-            filetypes=[("Archivos de video", "*.mp4 *.avi *.mov *.mkv")]
-        )
-        if not file_path:
-            return
+        #self.video_paused = False
+        #self.video_position = 0
+        #self.current_video = None
 
-        self._stop_video_thread()  # Detiene cualquier cámara activa
-        self.camera_name_label.config(text=f"Video local: {os.path.basename(file_path)}")
+        # ---------------- Helpers para detección ----------------
+    def _extract_boxes(self, results, classes=None, conf_thresh=0.3):
+        """
+        Extrae boxes en formato [x1,y1,x2,y2,cls,conf] de ultralytics.Results
+        - classes: lista de IDs de clases a filtrar (None = todas)
+        """
+        boxes = []
+        try:
+            r = results[0]  # results es lista por imagen
+            for box in r.boxes:
+                xyxy = box.xyxy.cpu().numpy().flatten()[:4].tolist()
+                cls = int(box.cls.cpu().numpy().item())
+                conf = float(box.conf.cpu().numpy().item())
+                if conf < conf_thresh:
+                    continue
+                if classes is None or cls in classes:
+                    boxes.append([xyxy[0], xyxy[1], xyxy[2], xyxy[3], cls, conf])
+        except Exception:
+            pass
+        return boxes
 
-        self.stop_thread.clear()
-        self.video_thread = threading.Thread(target=self._process_local_video, args=(file_path,), daemon=True)
-        self.video_thread.start()
+    def _center_from_box(self, box):
+        x1, y1, x2, y2 = box[:4]
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
 
-    def _process_local_video(self, file_path):
-        """Procesa un video local usando el modelo YOLO."""
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            self.video_label.after(0, lambda: self.video_label.config(text="No se pudo abrir el video"))
-            return
-
-        while not self.stop_thread.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                break  # fin del video
-
-            results = self.yolo_model(frame, verbose=False)
-            annotated_frame = results[0].plot()
-
-            # Redimensionar y mostrar
-            h, w, _ = annotated_frame.shape
-            aspect_ratio = w / h
-            label_w = self.video_label.winfo_width()
-            label_h = self.video_label.winfo_height()
-            new_w = label_w
-            new_h = int(new_w / aspect_ratio)
-            if new_h > label_h:
-                new_h = label_h
-                new_w = int(new_h * aspect_ratio)
-            if new_w > 0 and new_h > 0:
-                resized = cv2.resize(annotated_frame, (new_w, new_h))
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                img = ImageTk.PhotoImage(Image.fromarray(rgb))
-                self.video_label.after(0, self._update_video_label, img)
-
-            if results[0].boxes and len(results[0].boxes) > 1:  # al menos 2 montacargas
-                # Obtener coordenadas de las cajas
-                boxes = results[0].boxes.xyxy.cpu().numpy()  # cada fila: [x1, y1, x2, y2, conf, cls]
-                coords = [b[:4] for b in boxes]
-
-                if self._check_forklift_distance(coords, min_distance_px=120):
-                    description = "⚠️ Dos montacargas demasiado cerca"
-                    self._save_event_frame(
-                            Camera(id="local", name="VideoLocal", ip="", username="", password="", port=0), frame, description
-                        )
-
-
-
-        cap.release()
-        self.video_label.after(0, lambda: self.video_label.config(text="Fin del video local"))
-
-    def _on_exit(self):
-        self._stop_video_thread()
-        self.destroy()
+    def _get_class_index(self, model, target_name):
+        """Obtiene el índice de clase según el nombre (p.ej. 'person' o 'forklift')"""
+        for idx, name in model.names.items():
+            if name.lower() == target_name.lower():
+                return int(idx)
+        return None
 
     def _populate_camera_list(self):
         self._stop_video_thread()
@@ -181,7 +157,10 @@ class WinCameras(ttk.Frame):
 
     def _on_camera_select(self, event):
         selected = self.camera_listbox.curselection()
-        self._shown_event_ids = set()  # Reiniciar eventos mostrados al cambiar de cámara
+        self._shown_event_ids = set()  # Reiniciar eventos mostrados
+
+        # Detener cualquier video activo
+        self._stop_video_thread()
 
         if selected:
             self.edit_button.config(state="normal")
@@ -195,23 +174,45 @@ class WinCameras(ttk.Frame):
             self.edit_button.config(state="disabled")
             self.delete_button.config(state="disabled")
             self.camera_name_label.config(text="")
-            self._stop_video_thread()
             self.events_tree.delete(*self.events_tree.get_children())
 
     def _start_video_thread(self, camera):
+        """Inicia el hilo de video según el tipo de cámara (RTSP o webcam demo)."""
         if self.video_thread:
             self._stop_video_thread()
+
         self.stop_thread.clear()
-        self.video_thread = threading.Thread(target=self._video_loop, args=(camera,), daemon=True)
-        self.video_thread.start()
+        source = camera.get_rtsp_url()
+        self.current_camera = camera
+
+        is_webcam = isinstance(source, int) or (str(source).isdigit() and int(source) == 0)
+        is_rtsp = str(source).startswith("rtsp://") and not is_webcam
+
+        if is_webcam or is_rtsp:
+            self.video_thread = threading.Thread(target=self._video_loop, args=(camera,), daemon=True)
+            self.video_thread.start()
+        else:
+            print(f"[WARN] Fuente desconocida, no se reproduce: {source}")
 
     def _stop_video_thread(self):
         if self.video_thread and self.video_thread.is_alive():
             self.stop_thread.set()
             self.video_thread.join(timeout=1)
+
         self.video_thread = None
-        self.video_label.config(image=None, text="Seleccione una cámara")
-        self.video_label.image = None
+
+        # Limpiar la etiqueta de video
+        if hasattr(self, "video_label") and self.video_label.winfo_exists():
+            self.video_label.config(image=None, text="Seleccione una cámara")
+            self.video_label.image = None
+
+    def _on_exit(self):
+        self._stop_video_thread()
+        if hasattr(self, "video_label") and self.video_label.winfo_exists():
+            self.video_label.config(image='', text="Seleccione una cámara")
+        if hasattr(self, "camera_name_label") and self.camera_name_label.winfo_exists():
+            self.camera_name_label.config(text="")
+        self.destroy()
 
     def _video_loop(self, camera: Camera):
         cap = None
@@ -222,22 +223,48 @@ class WinCameras(ttk.Frame):
             if not cap.isOpened():
                 self.video_label.after(0, lambda: self.video_label.config(text=f"No se pudo conectar a {camera.name}"))
                 return
+
             while not self.stop_thread.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     break
-                results = self.yolo_model(frame, verbose=False)
-                if results[0].boxes and len(results[0].boxes) > 1:  # al menos 2 montacargas
-                    # Obtener coordenadas de las cajas
-                    boxes = results[0].boxes.xyxy.cpu().numpy()  # cada fila: [x1, y1, x2, y2, conf, cls]
-                    coords = [b[:4] for b in boxes]
 
-                    if self._check_forklift_distance(coords, min_distance_px=120):
-                        description = "⚠️ Dos montacargas demasiado cerca"
-                        self._save_event_frame(camera, frame, description)
+                # === Detección ===
+                results_person = self.yolo_person(frame, verbose=False)
+                results_forklift = self.yolo_model(frame, verbose=False)
 
+                # Extraer coordenadas
+                # --- Detectar personas ---
+                person_idx = self._get_class_index(self.yolo_person, "person")
+                persons = self._extract_boxes(results_person, classes=[person_idx] if person_idx is not None else None)
 
-                annotated_frame = results[0].plot()
+                # --- Detectar montacargas ---
+                forklift_idx = self._get_class_index(self.yolo_model, "forklift")
+                forklifts = self._extract_boxes(results_forklift, classes=[forklift_idx] if forklift_idx is not None else None)
+
+                def center(box):
+                    x1, y1, x2, y2 = box[:4]
+                    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+                # --- Dentro de _video_loop o _start_background_detection ---
+                alert_person_near_forklift = False
+                for p in persons:
+                    cx_p, cy_p = self._center_from_box(p)
+                    for f in forklifts:
+                        cx_f, cy_f = self._center_from_box(f)
+                        dist = ((cx_p - cx_f)**2 + (cy_p - cy_f)**2)**0.5
+                        if dist < 120:
+                            alert_person_near_forklift = True
+                            #cv2.putText(frame, "⚠️ Persona cerca del montacargas!", (30, 50),
+                                        #cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+                # === Registrar eventos ===
+                if (len(forklifts) > 1 and self._check_forklift_distance([b[:4] for b in forklifts], 120)) or alert_person_near_forklift:
+                    description = "⚠️ Dos montacargas demasiado cerca" if len(forklifts) > 1 else "⚠️ Persona cerca del montacargas"
+                    self._save_event_frame(camera, frame, description)
+
+                # === Mostrar frame en la interfaz ===
+                annotated_frame = results_forklift[0].plot()
                 h, w, _ = annotated_frame.shape
                 aspect_ratio = w / h
                 label_w = self.video_label.winfo_width()
@@ -252,6 +279,7 @@ class WinCameras(ttk.Frame):
                     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
                     img = ImageTk.PhotoImage(Image.fromarray(rgb))
                     self.video_label.after(0, self._update_video_label, img)
+
         except Exception as e:
             print(f"Error en hilo de video: {e}")
         finally:
@@ -288,26 +316,43 @@ class WinCameras(ttk.Frame):
                     return True  # dos montacargas demasiado cerca
         return False
 
-    def _save_event_frame(self, camera: Camera, frame, description="Objeto detectado"):
-        os.makedirs("events_images", exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{camera.name}_{timestamp}.jpg"
-        path = os.path.join("events_images", filename)
-    
+    def _save_event_frame(self, camera, frame, description):
+        """Guarda un evento con cooldown de 10 s por cámara y lo inserta en la BD."""
+        now = time.time()
+        if not hasattr(self, "last_event_times"):
+            self.last_event_times = {}
+
+        cam_key = getattr(camera, "name", str(camera))
+        
+        with self._event_lock:  # <--- bloquear aquí
+            last_time = self.last_event_times.get(cam_key, 0)
+            if now - last_time < 10:  # cooldown 10s
+                return
+            self.last_event_times[cam_key] = now
+
+        # Guardar imagen
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs("event_frames", exist_ok=True)
+        filename = f"{cam_key}_event_{timestamp}.jpg"
+        path = os.path.join("event_frames", filename)
+        cv2.imwrite(path, frame)
+
+        # Guardar en BD
         try:
-            cv2.imwrite(path, frame)
-            event = Event(
-                id=str(uuid.uuid4()),
+            ev = Event(
+                id=None,
                 camera_id=camera.id,
                 timestamp=timestamp,
                 description=description,
                 image_path=path
             )
-            self.db.add_event(event)  # <-- CORREGIDO
-            return event
+            event_id = self.db.add_event(ev)
+
+            # Guardar en Treeview con iid = event_id
+            self.events_tree.insert("", "end", iid=event_id, values=(timestamp, description))
+
         except Exception as e:
-            print(f"No se pudo guardar el evento: {e}")
-            return None
+            print(f"No se pudo guardar evento en BD: {e}")
 
     def _delete_camera(self):
         selected = self.camera_listbox.curselection()
@@ -398,15 +443,15 @@ class WinCameras(ttk.Frame):
         if not selected:
             return
 
-        event_id = selected[0]  # IID del Treeview, que es ev.id
-        values = self.events_tree.item(event_id, "values")
-        timestamp, description = values
-
-        # También necesitamos el nombre de la cámara
-        selected_cam_index = self.camera_listbox.curselection()
-        if not selected_cam_index:
+        event_id = int(selected[0])  # IID del Treeview = event.id
+        ev = self.db.get_event_by_id(event_id)
+        if not ev:
+            messagebox.showerror("Error", "No se encontró el evento en la BD")
             return
-        cam_name = self.camera_listbox.get(selected_cam_index[0])
+
+        # Obtener cámara para mostrar nombre
+        camera = next((cam for cam in self.db.get_all_cameras() if cam.id == ev.camera_id), None)
+        cam_name = camera.name if camera else "Desconocida"
 
         win = tk.Toplevel(self)
         win.title("Detalles del Evento")
@@ -415,16 +460,13 @@ class WinCameras(ttk.Frame):
         win.grab_set()
 
         ttk.Label(win, text=f"Cámara: {cam_name}", font=("Helvetica", 12, "bold")).pack(pady=5)
-        ttk.Label(win, text=f"Fecha/Hora: {timestamp}", font=("Helvetica", 10)).pack(pady=2)
-        ttk.Label(win, text=f"Descripción: {description}", font=("Helvetica", 10)).pack(pady=2)
+        ttk.Label(win, text=f"Fecha/Hora: {ev.timestamp}", font=("Helvetica", 10)).pack(pady=2)
+        ttk.Label(win, text=f"{ev.description}", font=("Helvetica", 10)).pack(pady=2)
 
-        # Buscar archivo en events_images/
-        pattern = f"events_images/{cam_name}_{timestamp}*.jpg"
-        files = glob.glob(pattern)
-        if files:
-            img_path = files[0]  # tomar el primero que coincida
+        # Mostrar imagen directamente desde el path guardado en BD
+        if ev.image_path and os.path.exists(ev.image_path):
             try:
-                img = Image.open(img_path)
+                img = Image.open(ev.image_path)
                 img.thumbnail((350, 250))
                 tk_img = ImageTk.PhotoImage(img)
                 lbl_img = ttk.Label(win, image=tk_img)
@@ -449,3 +491,92 @@ class WinCameras(ttk.Frame):
                 self.after(5000, refresh)
 
         refresh()  # llamada inicial
+
+    def _start_background_detection(self):
+        """Inicia hilos de detección continua para cámaras RTSP (excepto webcam)."""
+        def detect_forever(camera: Camera):
+            cap = None
+            try:
+                rtsp_url = camera.get_rtsp_url()
+                cap = cv2.VideoCapture(rtsp_url)
+                if not cap.isOpened():
+                    print(f"[{camera.name}] No se pudo conectar al RTSP")
+                    return
+
+                while True:  # bucle infinito (sin depender de la interfaz)
+                    ret, frame = cap.read()
+                    if not ret:
+                        print(f"[{camera.name}] Error de lectura, intentando reconectar...")
+                        cap.release()
+                        cv2.waitKey(2000)
+                        cap = cv2.VideoCapture(rtsp_url)
+                        continue
+
+                    # Detección
+                    results_person = self.yolo_person(frame, verbose=False)
+                    results_forklift = self.yolo_model(frame, verbose=False)
+
+                    # --- Detectar personas ---
+                    person_idx = self._get_class_index(self.yolo_person, "person")
+                    persons = self._extract_boxes(results_person, classes=[person_idx] if person_idx is not None else None)
+
+                    # --- Detectar montacargas ---
+                    forklift_idx = self._get_class_index(self.yolo_model, "forklift")
+                    forklifts = self._extract_boxes(results_forklift, classes=[forklift_idx] if forklift_idx is not None else None)
+
+                    def center(box):
+                        x1, y1, x2, y2 = box[:4]
+                        return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+                    # --- Dentro de _video_loop o _start_background_detection ---
+                    alert_person_near_forklift = False
+                    for p in persons:
+                        cx_p, cy_p = self._center_from_box(p)
+                        for f in forklifts:
+                            cx_f, cy_f = self._center_from_box(f)
+                            dist = ((cx_p - cx_f)**2 + (cy_p - cy_f)**2)**0.5
+                            if dist < 120:
+                                alert_person_near_forklift = True
+                                #cv2.putText(frame, "⚠️ Persona cerca del montacargas!", (30, 50),
+                                            #cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+                    # Guardar evento solo si hay al menos 1 montacargas
+                    if len(forklifts) > 0:
+                        if len(forklifts) > 1 and self._check_forklift_distance([b[0][:4] for b in forklifts], 120):
+                            description = "⚠️ Dos montacargas demasiado cerca"
+                            self._save_event_frame(camera, frame, description)
+                        elif alert_person_near_forklift:
+                            description = "⚠️ Persona cerca del montacargas"
+                            self._save_event_frame(camera, frame, description)
+
+                    cv2.waitKey(10)  # pequeña pausa para no saturar CPU
+
+            except Exception as e:
+                print(f"[{camera.name}] Error en detección en segundo plano: {e}")
+            finally:
+                if cap:
+                    cap.release()
+
+        # Crear un hilo por cámara RTSP
+        # Crear un hilo por cámara RTSP (omitimos webcams locales)
+        cameras = self.db.get_all_cameras()
+        
+        def is_local_camera(cam: Camera) -> bool:
+            """Determina si una cámara es local (webcam o dispositivo sin IP)."""
+            if not cam.ip:
+                return True
+            # si el campo IP es "0", "1", "2", "localhost", o el nombre es 'webcam'
+            if cam.ip.strip() in ["0", "1", "2", "localhost"] or cam.name.lower() in ["webcam", "camara local"]:
+                return True
+            return False
+        
+        for cam in cameras:
+            if is_local_camera(cam):
+                print(f"⛔ Cámara local omitida: {cam.name} ({cam.ip})")
+                continue
+            threading.Thread(target=detect_forever, args=(cam,), daemon=True).start()
+        
+        print(f"[INFO] Detección en segundo plano iniciada para {len(cameras)} cámaras RTSP (sin incluir webcams)")
+        
+
+        print(f"[INFO] Detección en segundo plano iniciada para {len(cameras)} cámaras RTSP")

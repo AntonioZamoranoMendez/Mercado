@@ -8,14 +8,12 @@ import os
 from ui.winHelp import WinHelp
 # --- Catálogos
 from ui.winCameras import WinCameras
-from ui.winEvents import WinEvents
 # --- Reportes
 from ui.winCamerasReport import WinCamerasRep
 from ui.winEventsReport import WinEventsRep
 from ui.winEvenCamRep import WinEventCamRep
 # --- Preferencias
 from ui.winAbout import WinAbout
-
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller"""
@@ -25,7 +23,6 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-
 class WinMain(Window):
     def __init__(self):
         super().__init__(title="Mercado")
@@ -33,11 +30,11 @@ class WinMain(Window):
         self.menu = Menu()
         self.archive = Menu(self.menu, tearoff=False)
         self.reports = Menu(self.menu, tearoff=False)
-        self.preferences = Menu(self.menu, tearoff=False)
+        #self.preferences = Menu(self.menu, tearoff=False)
 
         self.menu.add_cascade(menu=self.archive, label="Archivo")
         self.menu.add_cascade(menu=self.reports, label="Reportes")
-        self.menu.add_cascade(menu=self.preferences, label="Preferencias")
+        #self.menu.add_cascade(menu=self.preferences, label="Preferencias")
 
         self.archive.add_command(label="Ayuda",command=lambda: WinHelp(self))
         self.archive.add_command(label="Salir", command=self.destroy)
@@ -46,9 +43,9 @@ class WinMain(Window):
         self.reports.add_command(label="Reporte de Eventos", command=lambda: WinEventsRep(self))
         self.reports.add_command(label="Reporte de Evento por Cámara", command=lambda: WinEventCamRep(self))
 
-        self.preferences.add_command(label="Términos y Condiciones")
-        self.preferences.add_command(label="Políticas de Privacidad")
-        self.preferences.add_command(label="Acerca de SISA", command=lambda: WinAbout(self))
+        #self.preferences.add_command(label="Términos y Condiciones")
+        #self.preferences.add_command(label="Políticas de Privacidad")
+        #self.preferences.add_command(label="Acerca de SISA", command=lambda: WinAbout(self))
 
         self.config(menu=self.menu)
 
