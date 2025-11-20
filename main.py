@@ -1,4 +1,4 @@
-from functions.functions import cls, download_dependences, start_env
+from functions.functions import cls
 from ui.winMain import WinMain
 
 class Main:

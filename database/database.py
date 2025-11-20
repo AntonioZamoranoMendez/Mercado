@@ -4,19 +4,29 @@ from models.event import Event
 import os
 
 class Database:
-    def __init__(self, db_name="database.db"):
+    def __init__(self, db_name="database.db", db_path=None):
         """
         Inicializa la base de datos. Construye la ruta a la base de datos
         relativa a la ubicación de este archivo.
         """
-        self.db_path = os.path.join(os.path.dirname(__file__), db_name)
+        if db_path:
+            self.db_path = db_path
+        else:
+            self.db_path = os.path.join(os.path.dirname(__file__), db_name)
+
+        directory = os.path.dirname(self.db_path)
+        if directory and not os.path.exists(directory):
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError:
+                pass
+
         self._create_table()
 
     def _get_connection(self):
         """Crea y devuelve una conexión a la base de datos."""
-        return sqlite3.connect(self.db_path)
-    
-    
+        return sqlite3.connect(self.db_path, check_same_thread=False)
+
     def add_event(self, event: Event) -> int:
         """Agrega un nuevo evento a la base de datos."""
         try:
@@ -31,7 +41,6 @@ class Database:
         finally:
             if conn:
                 conn.close()
-    
 
     def _create_table(self):
         """Crea la tabla 'cameras' si no existe."""
@@ -45,7 +54,8 @@ class Database:
                     ip TEXT NOT NULL,
                     username TEXT NOT NULL,
                     password TEXT NOT NULL,
-                    port INTEGER NOT NULL
+                    port INTEGER NOT NULL,
+                    stream_path TEXT
                 )
             ''')
             cursor.execute('''
@@ -68,10 +78,9 @@ class Database:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id, name, ip, username, password, port FROM cameras ORDER BY name")
+            cursor.execute("SELECT id, name, ip, username, password, port, stream_path FROM cameras ORDER BY name")
             rows = cursor.fetchall()
-            return [Camera(id=row[0], name=row[1], ip=row[2], username=row[3], password=row[4], port=row[5]) for row in rows]
-            print(rows)
+            return [Camera(id=row[0], name=row[1], ip=row[2], username=row[3], password=row[4], port=row[5], stream_path=row[6]) for row in rows]
         finally:
             if conn:
                 conn.close()
@@ -82,8 +91,10 @@ class Database:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO cameras (name, ip, username, password, port) VALUES (?, ?, ?, ?, ?)",
-                (camera.name, camera.ip, camera.username, camera.password, camera.port)
+                # 1. Añadir la nueva columna
+                "INSERT INTO cameras (name, ip, username, password, port, stream_path) VALUES (?, ?, ?, ?, ?, ?)",
+                # 2. Añadir el nuevo valor del objeto camera
+                (camera.name, camera.ip, camera.username, camera.password, camera.port, camera.stream_path)
             )
             conn.commit()
             return cursor.lastrowid
@@ -91,17 +102,18 @@ class Database:
             if conn:
                 conn.close()
 
-    def update_camera(self, camera: Camera) -> bool:
+    def update_camera(self, camera: Camera):
         """Actualiza una cámara existente en la base de datos."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE cameras SET name=?, ip=?, username=?, password=?, port=? WHERE id=?",
-                (camera.name, camera.ip, camera.username, camera.password, camera.port, camera.id)
+                # 1. Añadir la nueva columna al SET
+                "UPDATE cameras SET name = ?, ip = ?, username = ?, password = ?, port = ?, stream_path = ? WHERE id = ?",
+                # 2. Añadir el nuevo valor del objeto camera
+                (camera.name, camera.ip, camera.username, camera.password, camera.port, camera.stream_path, camera.id)
             )
             conn.commit()
-            return cursor.rowcount > 0
         finally:
             if conn:
                 conn.close()
@@ -141,8 +153,6 @@ class Database:
         finally:
             if conn:
                 conn.close()
-
-
 
     def add_event(self, event: Event) -> int:
         """Agrega un nuevo evento a la base de datos."""

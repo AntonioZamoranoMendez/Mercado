@@ -1,6 +1,5 @@
 from tkinter import *
-from tkinter import ttk
-from PIL import Image, ImageTk
+import sv_ttk
 from models.window import Window
 import sys
 import os
@@ -10,7 +9,6 @@ from ui.winHelp import WinHelp
 from ui.winCameras import WinCameras
 # --- Reportes
 from ui.winCamerasReport import WinCamerasRep
-from ui.winEventsReport import WinEventsRep
 from ui.winEvenCamRep import WinEventCamRep
 # --- Preferencias
 from ui.winAbout import WinAbout
@@ -26,7 +24,7 @@ def resource_path(relative_path):
 class WinMain(Window):
     def __init__(self):
         super().__init__(title="Mercado")
-
+        sv_ttk.set_theme("dark")
         self.menu = Menu()
         self.archive = Menu(self.menu, tearoff=False)
         self.reports = Menu(self.menu, tearoff=False)
@@ -40,7 +38,6 @@ class WinMain(Window):
         self.archive.add_command(label="Salir", command=self.destroy)
 
         self.reports.add_command(label="Reporte de Cámaras", command=lambda: WinCamerasRep(self))
-        self.reports.add_command(label="Reporte de Eventos", command=lambda: WinEventsRep(self))
         self.reports.add_command(label="Reporte de Evento por Cámara", command=lambda: WinEventCamRep(self))
 
         #self.preferences.add_command(label="Términos y Condiciones")
@@ -49,9 +46,23 @@ class WinMain(Window):
 
         self.config(menu=self.menu)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
         # === Aquí reemplazamos la imagen por el diseño de WinCameras ===
         self.cameras_view = WinCameras(self)
         self.cameras_view.pack(fill=BOTH, expand=True)
 
         self.focus_force()
         self.mainloop()
+
+    def _on_window_close(self):
+            print("[WinMain] Interceptando cierre. Deteniendo hilo de video...")
+            try:
+                # Llama al método en WinCameras que detiene el hilo
+                # de la cámara que se está visualizando.
+                self.cameras_view._stop_video_thread()
+            except Exception as e:
+                print(f"Error al detener hilos de video: {e}")
+
+            # Ahora sí, destruye la ventana principal
+            self.destroy()

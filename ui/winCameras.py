@@ -15,7 +15,6 @@ from models.event import Event
 import math
 import time
 from datetime import datetime
-import threading
 
 def resource_path(relative_path):
     try:
@@ -24,12 +23,30 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+def get_storage_path():
+    '''
+    Retorna la ruta: C:/Users/Usuario/Documents/SistemaVigilancia
+    Crea la carpeta si no existe.
+    '''
+    # Obtiene la ruta a "Mis Documentos" de forma universal
+    user_docs = os.path.join(os.path.expanduser("~"), "Documents")
+    # Define el nombre de tu carpeta principal
+    app_folder = os.path.join(user_docs, "SistemaVigilancia")
+    # Crea la carpeta si no existe
+    if not os.path.exists(app_folder):
+        os.makedirs(app_folder)
+    return app_folder
+
 class WinCameras(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.pack(fill=tk.BOTH, expand=True)
+        self.storage_dir = get_storage_path()
+        print(f"[SISTEMA] Guardando datos en: {self.storage_dir}")
+        self.current_stream_id = 0
+        db_path = os.path.join(self.storage_dir, "vigilancia_data.db")
 
-        self.db = Database()
+        self.db = Database(db_path)
         self.cameras_map = {}
         self.video_thread = None
         self.stop_thread = threading.Event()
@@ -102,48 +119,27 @@ class WinCameras(ttk.Frame):
         self._populate_camera_list()
         self._start_background_detection()
 
-        self._event_lock = threading.Lock()
-        self.last_event_times = {}  # inicializamos aquí para que no haga falta hasattr
+    # --- winCameras.py ---
+    def _on_exit(self):
+        # 🔹 Detener cualquier hilo activo de video
+        self._stop_video_thread()
 
-        # --- Nuevo botón para subir video desde PC ---
-        #self.test_video_button = ttk.Button(button_frame, text="Probar video local", command=self._load_local_video)
-        #self.test_video_button.pack(side=tk.RIGHT, padx=5)
+        # 🔹 Limpiar el contenido del video
+        if hasattr(self, "video_label") and self.video_label.winfo_exists():
+            self.video_label.config(image='', text="Selecciona una cámara o video")
 
-        #self.video_paused = False
-        #self.video_position = 0
-        #self.current_video = None
+        # 🔹 Limpiar etiquetas de título o cámara
+        if hasattr(self, "camera_name_label") and self.camera_name_label.winfo_exists():
+            self.camera_name_label.config(text="")
+        if hasattr(self, "video_title_label") and self.video_title_label.winfo_exists():
+            self.video_title_label.config(text="")
 
-        # ---------------- Helpers para detección ----------------
-    def _extract_boxes(self, results, classes=None, conf_thresh=0.3):
-        """
-        Extrae boxes en formato [x1,y1,x2,y2,cls,conf] de ultralytics.Results
-        - classes: lista de IDs de clases a filtrar (None = todas)
-        """
-        boxes = []
-        try:
-            r = results[0]  # results es lista por imagen
-            for box in r.boxes:
-                xyxy = box.xyxy.cpu().numpy().flatten()[:4].tolist()
-                cls = int(box.cls.cpu().numpy().item())
-                conf = float(box.conf.cpu().numpy().item())
-                if conf < conf_thresh:
-                    continue
-                if classes is None or cls in classes:
-                    boxes.append([xyxy[0], xyxy[1], xyxy[2], xyxy[3], cls, conf])
-        except Exception:
-            pass
-        return boxes
+        # 🔹 Quitar los controles del video si existen
+        if hasattr(self, "video_controls_frame") and self.video_controls_frame.winfo_exists():
+            self.video_controls_frame.destroy()
 
-    def _center_from_box(self, box):
-        x1, y1, x2, y2 = box[:4]
-        return ((x1 + x2) / 2, (y1 + y2) / 2)
-
-    def _get_class_index(self, model, target_name):
-        """Obtiene el índice de clase según el nombre (p.ej. 'person' o 'forklift')"""
-        for idx, name in model.names.items():
-            if name.lower() == target_name.lower():
-                return int(idx)
-        return None
+        # 🔹 Finalmente destruir la ventana
+        self.destroy()
 
     def _populate_camera_list(self):
         self._stop_video_thread()
@@ -157,9 +153,6 @@ class WinCameras(ttk.Frame):
 
     def _on_camera_select(self, event):
         selected = self.camera_listbox.curselection()
-        self._shown_event_ids = set()  # Reiniciar eventos mostrados
-
-        # Detener cualquier video activo
         self._stop_video_thread()
 
         if selected:
@@ -167,32 +160,50 @@ class WinCameras(ttk.Frame):
             self.delete_button.config(state="normal")
             name = self.camera_listbox.get(selected[0])
             cam = self.cameras_map[name]
+
+            self.current_camera = cam
+            self.events_tree.delete(*self.events_tree.get_children())
+
             self.camera_name_label.config(text=f"Cámara: {cam.name}")
+
             self._start_video_thread(cam)
-            self._refresh_events_loop(cam)
+            self._refresh_events_loop(cam) # Esto cargará el historial
+
         else:
+            self.current_camera = None
             self.edit_button.config(state="disabled")
             self.delete_button.config(state="disabled")
             self.camera_name_label.config(text="")
             self.events_tree.delete(*self.events_tree.get_children())
 
     def _start_video_thread(self, camera):
-        """Inicia el hilo de video según el tipo de cámara (RTSP o webcam demo)."""
+        """Inicia el hilo de video para visualización en pantalla principal."""
+        # Si hay un hilo de video activo, detenerlo primero
         if self.video_thread:
             self._stop_video_thread()
 
         self.stop_thread.clear()
-        source = camera.get_rtsp_url()
         self.current_camera = camera
+        self.current_stream_id += 1
+        stream_id = self.current_stream_id
 
-        is_webcam = isinstance(source, int) or (str(source).isdigit() and int(source) == 0)
-        is_rtsp = str(source).startswith("rtsp://") and not is_webcam
-
-        if is_webcam or is_rtsp:
-            self.video_thread = threading.Thread(target=self._video_loop, args=(camera,), daemon=True)
-            self.video_thread.start()
+        if camera.ip.strip() == "0":
+                source = 0
         else:
-            print(f"[WARN] Fuente desconocida, no se reproduce: {source}")
+            source = camera.get_rtsp_url()
+
+        print(f"[INFO] Conectando a cámara: {camera.name} ({source})")
+
+        # Destruir controles viejos si existen (limpieza)
+        if hasattr(self, "video_controls_frame") and self.video_controls_frame.winfo_exists():
+            self.video_controls_frame.destroy()
+
+        self.video_thread = threading.Thread(
+            target=self._video_loop, 
+            args=(camera, stream_id), 
+            daemon=True
+        )
+        self.video_thread.start()
 
     def _stop_video_thread(self):
         if self.video_thread and self.video_thread.is_alive():
@@ -200,98 +211,139 @@ class WinCameras(ttk.Frame):
             self.video_thread.join(timeout=1)
 
         self.video_thread = None
+        self.current_video = None
+        
+        # Limpiar la etiqueta de video de forma segura
+        if hasattr(self, "video_label") and self.video_label.winfo_exists():
+            try:
+                self.video_label.config(image='', text="Seleccione una cámara")
+                self.video_label.image = None
+            except Exception as e:
+                print(f"Advertencia al limpiar video: {e}")
+
+        if hasattr(self, "video_controls_frame") and self.video_controls_frame.winfo_exists():
+            self.video_controls_frame.destroy()
 
         # Limpiar la etiqueta de video
         if hasattr(self, "video_label") and self.video_label.winfo_exists():
             self.video_label.config(image=None, text="Seleccione una cámara")
             self.video_label.image = None
 
-    def _on_exit(self):
-        self._stop_video_thread()
-        if hasattr(self, "video_label") and self.video_label.winfo_exists():
-            self.video_label.config(image='', text="Seleccione una cámara")
-        if hasattr(self, "camera_name_label") and self.camera_name_label.winfo_exists():
-            self.camera_name_label.config(text="")
-        self.destroy()
+        if hasattr(self, "video_controls_frame") and self.video_controls_frame.winfo_exists():
+            self.video_controls_frame.destroy()
 
-    def _video_loop(self, camera: Camera):
+    def _video_loop(self, camera, stream_id):
         cap = None
         try:
-            rtsp_url = camera.get_rtsp_url()
-            self.video_label.after(0, lambda: self.video_label.config(text=f"Conectando a {camera.name}..."))
-            cap = cv2.VideoCapture(rtsp_url)
+            if stream_id != self.current_stream_id: return
+            src = 0 if camera.ip.strip() == "0" else camera.get_rtsp_url()
+            
+            if stream_id == self.current_stream_id:
+                self.video_label.after(0, lambda: self.video_label.config(text=f"Conectando {camera.name}..."))
+            
+            cap = cv2.VideoCapture(src)
             if not cap.isOpened():
-                self.video_label.after(0, lambda: self.video_label.config(text=f"No se pudo conectar a {camera.name}"))
+                if stream_id == self.current_stream_id:
+                    self.video_label.after(0, lambda: self.video_label.config(text="Error Conexión"))
                 return
 
+            # === VARIABLES PARA OPTIMIZACIÓN ===
+            frame_count = 0
+            SKIP_FRAMES = 10  # Detectar cada 10 frames (3 detect/seg aprox en 30fps)
+            
+            # Guardamos las detecciones para pintarlas en los frames que saltamos
+            cached_persons = [] 
+            cached_forklifts = []
+            # ===================================
+
             while not self.stop_thread.is_set():
+                if stream_id != self.current_stream_id: break
                 ret, frame = cap.read()
-                if not ret:
-                    break
+                if not ret: break
 
-                # === Detección ===
-                results_person = self.yolo_person(frame, verbose=False)
-                results_forklift = self.yolo_model(frame, verbose=False)
+                frame_count += 1
 
-                # Extraer coordenadas
-                # --- Detectar personas ---
-                person_idx = self._get_class_index(self.yolo_person, "person")
-                persons = self._extract_boxes(results_person, classes=[person_idx] if person_idx is not None else None)
+                # --- DETECCIÓN (Solo 1 de cada 10 frames) ---
+                if frame_count % SKIP_FRAMES == 0:
+                    
+                    # 1. Reducir tamaño solo para la IA (Más rápido)
+                    frame_small = cv2.resize(frame, (640, int(frame.shape[0]*(640/frame.shape[1]))))
+                    
+                    # 2. Inferir
+                    res_p = self.yolo_person(frame_small, verbose=False)
+                    res_f = self.yolo_model(frame_small, verbose=False, conf=0.5)
+                    
+                    # 3. Calcular escala para adaptar cajas al tamaño real
+                    scale_x = frame.shape[1] / 640
+                    scale_y = frame.shape[0] / frame_small.shape[0]
 
-                # --- Detectar montacargas ---
-                forklift_idx = self._get_class_index(self.yolo_model, "forklift")
-                forklifts = self._extract_boxes(results_forklift, classes=[forklift_idx] if forklift_idx is not None else None)
+                    # 4. Limpiar y actualizar caché de detecciones
+                    cached_persons = []
+                    for box in res_p[0].boxes:
+                        if int(box.cls[0]) == 0:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            # Guardamos coords reales
+                            cached_persons.append([x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y])
 
-                def center(box):
-                    x1, y1, x2, y2 = box[:4]
-                    return ((x1 + x2) / 2, (y1 + y2) / 2)
+                    cached_forklifts = []
+                    for box in res_f[0].boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        # Guardamos coords reales
+                        cached_forklifts.append([x1*scale_x, y1*scale_y, x2*scale_x, y2*scale_y])
 
-                # --- Dentro de _video_loop o _start_background_detection ---
-                alert_person_near_forklift = False
-                for p in persons:
-                    cx_p, cy_p = self._center_from_box(p)
-                    for f in forklifts:
-                        cx_f, cy_f = self._center_from_box(f)
-                        dist = ((cx_p - cx_f)**2 + (cy_p - cy_f)**2)**0.5
-                        if dist < 120:
-                            alert_person_near_forklift = True
-                            #cv2.putText(frame, "⚠️ Persona cerca del montacargas!", (30, 50),
-                                        #cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                    # 5. Lógica de Alerta (Solo se calcula cuando detectamos)
+                    alert = False
+                    def get_center(b): return ((b[0]+b[2])/2, (b[1]+b[3])/2)
+                    
+                    for p in cached_persons:
+                        cp = get_center(p)
+                        for f in cached_forklifts:
+                            cf = get_center(f)
+                            if math.dist(cp, cf) < 120: alert = True
+                    
+                    if (len(cached_forklifts) > 1 and self._check_forklift_dist(cached_forklifts)) or alert:
+                        msg = "⚠️ Choque Montacargas" if len(cached_forklifts)>1 else "⚠️ Persona en Riesgo"
+                        # Guardamos el frame ORIGINAL actual
+                        self._save_event_frame(camera, frame, msg)
 
-                # === Registrar eventos ===
-                if (len(forklifts) > 1 and self._check_forklift_distance([b[:4] for b in forklifts], 120)) or alert_person_near_forklift:
-                    description = "⚠️ Dos montacargas demasiado cerca" if len(forklifts) > 1 else "⚠️ Persona cerca del montacargas"
-                    self._save_event_frame(camera, frame, description)
+                # --- DIBUJADO (En TODOS los frames usando caché) ---
+                # Usamos las listas 'cached_' que contienen la info del último frame detectado
+                for f in cached_forklifts:
+                    cv2.rectangle(frame, (int(f[0]), int(f[1])), (int(f[2]), int(f[3])), (255,0,0), 2)
+                for p in cached_persons:
+                    cv2.rectangle(frame, (int(p[0]), int(p[1])), (int(p[2]), int(p[3])), (0,255,0), 2)
 
-                # === Mostrar frame en la interfaz ===
-                annotated_frame = results_forklift[0].plot()
-                h, w, _ = annotated_frame.shape
-                aspect_ratio = w / h
-                label_w = self.video_label.winfo_width()
-                label_h = self.video_label.winfo_height()
-                new_w = label_w
-                new_h = int(new_w / aspect_ratio)
-                if new_h > label_h:
-                    new_h = label_h
-                    new_w = int(new_h * aspect_ratio)
-                if new_w > 0 and new_h > 0:
-                    resized = cv2.resize(annotated_frame, (new_w, new_h))
-                    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    img = ImageTk.PhotoImage(Image.fromarray(rgb))
-                    self.video_label.after(0, self._update_video_label, img)
+                # --- UI UPDATE (En TODOS los frames para video fluido) ---
+                if stream_id != self.current_stream_id: break
+                if self.video_label.winfo_exists():
+                    lw, lh = self.video_label.winfo_width(), self.video_label.winfo_height()
+                    if lw > 1 and lh > 1:
+                        scale = min(lw/frame.shape[1], lh/frame.shape[0])
+                        nw, nh = int(frame.shape[1]*scale), int(frame.shape[0]*scale)
+                        if nw>0 and nh>0:
+                            resized = cv2.resize(frame, (nw, nh))
+                            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                            
+                            pil_img = Image.fromarray(rgb)
+                            self.video_label.after(0, self._update_video_label, pil_img, stream_id)
 
-        except Exception as e:
-            print(f"Error en hilo de video: {e}")
-        finally:
-            if cap:
-                cap.release()
-            if not self.stop_thread.is_set():
-                self.video_label.after(0, lambda: self.video_label.config(text=f"Se perdió conexión con {camera.name}"))
+        except Exception as e: print(f"Video Error: {e}")
+        finally: 
+            if cap: cap.release()
 
-    def _update_video_label(self, tk_image):
+    def _update_video_label(self, pil_image, stream_id):
+        # Protección contra condición de carrera
+        if stream_id != self.current_stream_id:
+            return
+
         if not self.stop_thread.is_set():
-            self.video_label.config(image=tk_image, text="")
-            self.video_label.image = tk_image
+            try:
+                tk_image = ImageTk.PhotoImage(pil_image)
+                
+                self.video_label.config(image=tk_image, text="")
+                self.video_label.image = tk_image # Referencia para evitar Garbage Collection
+            except Exception as e:
+                print(f"Error actualizando frame: {e}")
 
     def _check_forklift_distance(self, boxes, min_distance_px=100):
         """
@@ -317,42 +369,65 @@ class WinCameras(ttk.Frame):
         return False
 
     def _save_event_frame(self, camera, frame, description):
-        """Guarda un evento con cooldown de 10 s por cámara y lo inserta en la BD."""
+        """Guarda un evento en disco Y en la base de datos con cooldown."""
         now = time.time()
+
+        # Asegurar que existe el diccionario de tiempos por cámara
         if not hasattr(self, "last_event_times"):
             self.last_event_times = {}
 
+        # Obtener clave única para el cooldown
         cam_key = getattr(camera, "name", str(camera))
-        
-        with self._event_lock:  # <--- bloquear aquí
-            last_time = self.last_event_times.get(cam_key, 0)
-            if now - last_time < 10:  # cooldown 10s
-                return
-            self.last_event_times[cam_key] = now
 
-        # Guardar imagen
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs("event_frames", exist_ok=True)
-        filename = f"{cam_key}_event_{timestamp}.jpg"
-        path = os.path.join("event_frames", filename)
+        # Cooldown de 10 segundos
+        last_time = self.last_event_times.get(cam_key, 0)
+        if now - last_time < 10:
+            return
+        self.last_event_times[cam_key] = now
+
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        filename_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        safe_cam_name = "".join(c for c in cam_key if c.isalnum() or c in (' ', '_', '-')).strip().replace(" ", "_")
+        filename = f"{safe_cam_name}_{filename_ts}.jpg"
+
+        # 1. Guardar archivo en Documentos
+        frames_folder = os.path.join(self.storage_dir, "event_frames")
+        os.makedirs(frames_folder, exist_ok=True)
+        path = os.path.join(frames_folder, filename)
+
         cv2.imwrite(path, frame)
+        print(f"[EVENTO] Imagen guardada en: {path}")
 
-        # Guardar en BD
+        # 2. Guardar en Base de Datos y Actualizar UI
+        if hasattr(camera, 'id') and camera.id is not None:
+            try:
+                # Crear objeto evento
+                new_event = Event(
+                    camera_id=camera.id,
+                    timestamp=timestamp_str,
+                    description=description,
+                    image_path=path
+                )
+
+                # Guardar en DB (Esto sí se puede hacer en el hilo)
+                event_id = self.db.add_event(new_event)
+
+                # 3. Actualizar la Interfaz DE FORMA SEGURA
+                # Usamos self.after para que la inserción ocurra en el hilo principal
+                if self.current_camera and self.current_camera.id == camera.id:
+                    self.after(0, lambda: self._safe_tree_insert(event_id, timestamp_str, description))
+
+            except Exception as e:
+                print(f"[ERROR DB] No se pudo guardar evento: {e}")
+
+    def _safe_tree_insert(self, event_id, timestamp, description):
+        """Función auxiliar para insertar en el Treeview desde el hilo principal."""
         try:
-            ev = Event(
-                id=None,
-                camera_id=camera.id,
-                timestamp=timestamp,
-                description=description,
-                image_path=path
-            )
-            event_id = self.db.add_event(ev)
-
-            # Guardar en Treeview con iid = event_id
-            self.events_tree.insert("", "end", iid=event_id, values=(timestamp, description))
-
+            if not self.events_tree.exists(event_id):
+                self.events_tree.insert("", 0, iid=event_id, values=(timestamp, description))
         except Exception as e:
-            print(f"No se pudo guardar evento en BD: {e}")
+            print(f"Error UI Treeview: {e}")
 
     def _delete_camera(self):
         selected = self.camera_listbox.curselection()
@@ -439,144 +514,189 @@ class WinCameras(ttk.Frame):
             self.events_tree.column("description", width=int(self.events_tree.winfo_width() * 0.6))
 
     def _on_event_select(self, event):
+        """Muestra la imagen del evento seleccionado consultando la BD."""
         selected = self.events_tree.selection()
         if not selected:
             return
 
-        event_id = int(selected[0])  # IID del Treeview = event.id
-        ev = self.db.get_event_by_id(event_id)
-        if not ev:
-            messagebox.showerror("Error", "No se encontró el evento en la BD")
+        # El IID en el Treeview es el ID del evento en la Base de Datos
+        event_id_str = selected[0]
+        
+        # Validar si es un ID de base de datos (número entero)
+        if not str(event_id_str).isdigit():
+            messagebox.showinfo("Info", "Este evento es de una sesión local y no tiene imagen persistente.")
             return
 
-        # Obtener cámara para mostrar nombre
-        camera = next((cam for cam in self.db.get_all_cameras() if cam.id == ev.camera_id), None)
-        cam_name = camera.name if camera else "Desconocida"
+        event_id = int(event_id_str)
 
+        # --- RECUPERAR RUTA DESDE LA BD ---
+        event_obj = self.db.get_event_by_id(event_id)
+        
+        if not event_obj:
+            messagebox.showerror("Error", "No se encontró el evento en la base de datos.")
+            return
+
+        img_path = event_obj.image_path
+        timestamp = event_obj.timestamp
+        description = event_obj.description
+
+        # Crear ventana emergente
         win = tk.Toplevel(self)
         win.title("Detalles del Evento")
-        win.geometry("400x400")
-        win.resizable(False, False)
+        # win.geometry("400x450") # Opcional: dejar que se ajuste sola
         win.grab_set()
 
-        ttk.Label(win, text=f"Cámara: {cam_name}", font=("Helvetica", 12, "bold")).pack(pady=5)
-        ttk.Label(win, text=f"Fecha/Hora: {ev.timestamp}", font=("Helvetica", 10)).pack(pady=2)
-        ttk.Label(win, text=f"{ev.description}", font=("Helvetica", 10)).pack(pady=2)
+        ttk.Label(win, text=f"Fecha: {timestamp}", font=("Helvetica", 10, "bold")).pack(pady=(10, 2))
+        ttk.Label(win, text=f"Evento: {description}", font=("Helvetica", 10)).pack(pady=2)
+        ttk.Label(win, text=f"Ruta: {img_path}", font=("Arial", 8), foreground="gray").pack(pady=2)
 
-        # Mostrar imagen directamente desde el path guardado en BD
-        if ev.image_path and os.path.exists(ev.image_path):
+        # Cargar imagen
+        if img_path and os.path.exists(img_path):
             try:
-                img = Image.open(ev.image_path)
-                img.thumbnail((350, 250))
+                img = Image.open(img_path)
+                # Redimensionar manteniendo proporción para que quepa en ventana
+                img.thumbnail((400, 300)) 
                 tk_img = ImageTk.PhotoImage(img)
+                
                 lbl_img = ttk.Label(win, image=tk_img)
-                lbl_img.image = tk_img
-                lbl_img.pack(pady=10)
+                lbl_img.image = tk_img  # Referencia para evitar garbage collection
+                lbl_img.pack(pady=10, padx=10)
             except Exception as e:
-                ttk.Label(win, text=f"No se pudo cargar la imagen:\n{e}").pack(pady=10)
+                ttk.Label(win, text=f"Error al abrir imagen:\n{e}", foreground="red").pack(pady=10)
         else:
-            ttk.Label(win, text="No se encontró la imagen del evento").pack(pady=10)
+            ttk.Label(win, text="❌ Archivo de imagen no encontrado en disco", foreground="red").pack(pady=20)
 
     def _refresh_events_loop(self, camera: Camera):
+        """Carga eventos históricos y busca nuevos periódicamente."""
         def refresh():
-            try:
-                events = self.db.get_events_by_camera(camera.id)
-                for ev in events:
-                    if not self.events_tree.exists(ev.id):  # evita duplicados
-                        self.events_tree.insert("", tk.END, iid=ev.id, values=(ev.timestamp, ev.description))
-            except Exception as e:
-                print(f"Error refrescando eventos: {e}")
-            finally:
-                # se llama a sí misma cada 5 segundos
-                self.after(5000, refresh)
+            # 1. Verificar si el usuario sigue viendo ESTA cámara
+            if self.current_camera is None or self.current_camera.id != camera.id:
+                return # Si cambió de cámara, matamos este bucle
 
-        refresh()  # llamada inicial
+            try:
+                # 2. Obtener eventos (Vienen ordenados: Nuevo -> Viejo)
+                events = self.db.get_events_by_camera(camera.id)
+                
+                for ev in events:
+                    # 3. Solo insertar si no existe en la lista
+                    if not self.events_tree.exists(ev.id):
+                        self.events_tree.insert("", tk.END, iid=ev.id, values=(ev.timestamp, ev.description))
+            
+            except Exception as e:
+                print(f"Error refresh: {e}")
+            finally:
+                # 4. Repetir cada 3 segundos si seguimos en la misma cámara
+                if self.current_camera and self.current_camera.id == camera.id:
+                    self.after(3000, refresh)
+
+        refresh() # Llamada inmediata inicial
 
     def _start_background_detection(self):
-        """Inicia hilos de detección continua para cámaras RTSP (excepto webcam)."""
-        def detect_forever(camera: Camera):
-            cap = None
-            try:
-                rtsp_url = camera.get_rtsp_url()
-                cap = cv2.VideoCapture(rtsp_url)
-                if not cap.isOpened():
-                    print(f"[{camera.name}] No se pudo conectar al RTSP")
-                    return
+        """Inicia detección en segundo plano optimizada para ALTA CARGA (10+ cámaras)."""
+        import random # Necesario para evitar picos de CPU
 
-                while True:  # bucle infinito (sin depender de la interfaz)
+        def detect_forever(camera: Camera):
+            # Retraso inicial aleatorio para que no arranquen las 10 hilos a la vez
+            time.sleep(random.uniform(0.5, 5.0))
+            
+            cap = None
+            rtsp_url = camera.get_rtsp_url()
+            
+            # Intentar conectar
+            try:
+                cap = cv2.VideoCapture(rtsp_url)
+            except:
+                pass # Se manejará en el bucle
+
+            print(f"[HILO] Iniciado monitor para: {camera.name}")
+
+            while True:
+                # 1. PAUSA: Análisis cada 1.5 segundos para 10 cámaras (Ajustable)
+                # Si tu PC es muy potente, puedes bajarlo a 1.0 o 0.5
+                time.sleep(1.5) 
+
+                try:
+                    # 2. RECONEXIÓN ROBUSTA
+                    if cap is None or not cap.isOpened():
+                        cap = cv2.VideoCapture(rtsp_url)
+                        if not cap.isOpened():
+                            time.sleep(2) # Esperar antes de reintentar
+                            continue
+                    
+                    # 3. LIMPIEZA DE BUFFER (Truco RTSP)
+                    # Leemos y descartamos frames viejos acumulados durante el sleep
+                    for _ in range(4):
+                        cap.grab() 
+                    
+                    # Leemos el frame real
                     ret, frame = cap.read()
                     if not ret:
-                        print(f"[{camera.name}] Error de lectura, intentando reconectar...")
+                        print(f"[{camera.name}] Señal perdida. Reconectando...")
                         cap.release()
-                        cv2.waitKey(2000)
-                        cap = cv2.VideoCapture(rtsp_url)
+                        cap = None
                         continue
 
-                    # Detección
-                    results_person = self.yolo_person(frame, verbose=False)
-                    results_forklift = self.yolo_model(frame, verbose=False)
+                    # 4. OPTIMIZACIÓN CRÍTICA: Redimensionar
+                    # Procesar 1080p x 10 cámaras mata la CPU. Usamos 640px.
+                    # YOLO funciona excelente con 640x640 o similar.
+                    h, w = frame.shape[:2]
+                    scale = 640 / w
+                    new_h = int(h * scale)
+                    frame_small = cv2.resize(frame, (640, new_h))
 
-                    # --- Detectar personas ---
-                    person_idx = self._get_class_index(self.yolo_person, "person")
-                    persons = self._extract_boxes(results_person, classes=[person_idx] if person_idx is not None else None)
+                    # --- Detección sobre frame_small (Más rápido) ---
+                    results_person = self.yolo_person(frame_small, verbose=False)
+                    # Usamos conf=0.55 para ser más estrictos en background
+                    results_forklift = self.yolo_model(frame_small, verbose=False, conf=0.55)
 
-                    # --- Detectar montacargas ---
-                    forklift_idx = self._get_class_index(self.yolo_model, "forklift")
-                    forklifts = self._extract_boxes(results_forklift, classes=[forklift_idx] if forklift_idx is not None else None)
+                    persons = [b.xyxy.cpu().numpy() for b in results_person[0].boxes if int(b.cls[0]) == 0]
+                    forklifts = [b.xyxy.cpu().numpy() for b in results_forklift[0].boxes]
 
+                    # Función center ajustada al frame pequeño
                     def center(box):
                         x1, y1, x2, y2 = box[:4]
                         return ((x1 + x2) / 2, (y1 + y2) / 2)
 
-                    # --- Dentro de _video_loop o _start_background_detection ---
+                    # Verificar cercanía
+                    # Nota: Como redimensionamos la imagen, la distancia en píxeles cambia.
+                    # 120px en 1080p es aprox 40px en 640p. Ajustamos el umbral a 45.
+                    umbral_distancia = 45 
+                    
                     alert_person_near_forklift = False
                     for p in persons:
-                        cx_p, cy_p = self._center_from_box(p)
+                        cx_p, cy_p = center(p[0])
                         for f in forklifts:
-                            cx_f, cy_f = self._center_from_box(f)
-                            dist = ((cx_p - cx_f)**2 + (cy_p - cy_f)**2)**0.5
-                            if dist < 120:
+                            cx_f, cy_f = center(f[0])
+                            dist = ((cx_p - cx_f) ** 2 + (cy_p - cy_f) ** 2) ** 0.5
+                            if dist < umbral_distancia:
                                 alert_person_near_forklift = True
-                                #cv2.putText(frame, "⚠️ Persona cerca del montacargas!", (30, 50),
-                                            #cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-                    # Guardar evento solo si hay al menos 1 montacargas
-                    if len(forklifts) > 0:
-                        if len(forklifts) > 1 and self._check_forklift_distance([b[0][:4] for b in forklifts], 120):
-                            description = "⚠️ Dos montacargas demasiado cerca"
-                            self._save_event_frame(camera, frame, description)
-                        elif alert_person_near_forklift:
-                            description = "⚠️ Persona cerca del montacargas"
-                            self._save_event_frame(camera, frame, description)
+                    # --- Guardar evento ---
+                    if (len(forklifts) > 1 and self._check_forklift_distance([b[0][:4] for b in forklifts], umbral_distancia)) or alert_person_near_forklift:
+                        description = "⚠️ Dos montacargas cerca" if len(forklifts) > 1 else "⚠️ Persona cerca de maquina"
+                        # Importante: Guardamos el frame ORIGINAL (alta calidad), no el pequeño
+                        self._save_event_frame(camera, frame, description)
 
-                    cv2.waitKey(10)  # pequeña pausa para no saturar CPU
+                except Exception as e:
+                    # Evitar que un error en una cámara detenga el hilo
+                    print(f"Error en hilo {camera.name}: {e}")
+                    time.sleep(1)
 
-            except Exception as e:
-                print(f"[{camera.name}] Error en detección en segundo plano: {e}")
-            finally:
-                if cap:
-                    cap.release()
-
-        # Crear un hilo por cámara RTSP
-        # Crear un hilo por cámara RTSP (omitimos webcams locales)
+        # --- Lanzar hilos ---
         cameras = self.db.get_all_cameras()
         
         def is_local_camera(cam: Camera) -> bool:
-            """Determina si una cámara es local (webcam o dispositivo sin IP)."""
-            if not cam.ip:
-                return True
-            # si el campo IP es "0", "1", "2", "localhost", o el nombre es 'webcam'
-            if cam.ip.strip() in ["0", "1", "2", "localhost"] or cam.name.lower() in ["webcam", "camara local"]:
+            if not cam.ip: return True
+            if cam.ip.strip() in ["0", "1", "2", "localhost"] or "webcam" in cam.name.lower():
                 return True
             return False
         
+        count = 0
         for cam in cameras:
             if is_local_camera(cam):
-                print(f"⛔ Cámara local omitida: {cam.name} ({cam.ip})")
                 continue
+            # Daemon=True asegura que los hilos mueran al cerrar la app
             threading.Thread(target=detect_forever, args=(cam,), daemon=True).start()
+            count += 1
         
-        print(f"[INFO] Detección en segundo plano iniciada para {len(cameras)} cámaras RTSP (sin incluir webcams)")
-        
-
-        print(f"[INFO] Detección en segundo plano iniciada para {len(cameras)} cámaras RTSP")
+        print(f"[SISTEMA] Vigilancia activa en {count} cámaras (Modo Ahorro CPU activado)")
